@@ -1,4 +1,3 @@
-# railway.json - Configuração para deploy automático na Railway
 {
   "build": {
     "builder": "NIXPACKS",
