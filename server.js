@@ -67,29 +67,44 @@ async function generateAIResponse(userText, conversationHistory = []) {
 
 // Gerenciar conexões WebSocket
 wss.on('connection', (ws, req) => {
-  // Inicializar callSid como null - será extraído do evento 'start'
+  // Extrair callSid da URL (o Twilio SEMPRE adiciona este parâmetro)
   let callSid = null;
   
   try {
-    // Log da tentativa de conexão com todos os headers para diagnóstico
+    // Construir URL correta usando headers do host
+    const host = req.headers.host || 'localhost:8080';
+    const fullUrl = new URL(req.url, `http://${host}`);
+    callSid = fullUrl.searchParams.get('callSid');
+    
     logEvent('CONNECTION_ATTEMPT', {
       url: req.url,
       host: req.headers.host,
-      headers: req.headers,
+      fullUrl: fullUrl.toString(),
+      callSid: callSid,
       userAgent: req.headers['user-agent'],
       origin: req.headers.origin
     });
-  } catch (error) {
-    logEvent('CONNECTION_LOG_ERROR', {
-      error: error.message,
+  } catch (urlError) {
+    logEvent('URL_PARSE_ERROR', {
+      error: urlError.message,
       originalUrl: req.url,
       headers: req.headers
     });
   }
   
-  // Gerar callSid temporário para debug até receber o real
-  const tempCallSid = `TEMP_${Date.now()}`;
-  callSid = tempCallSid;
+  // Usar callSid da URL ou gerar temporário se não existir
+  if (!callSid) {
+    callSid = `TEMP_${Date.now()}`;
+    logEvent('USING_TEMP_CALLSID', { 
+      callSid,
+      reason: 'No callSid found in URL query string'
+    });
+  } else {
+    logEvent('CALLSID_EXTRACTED', { 
+      callSid, 
+      source: 'url_query_string'
+    });
+  }
   
   // Validação de origem Twilio
   const userAgent = req.headers['user-agent'] || '';
@@ -97,14 +112,14 @@ wss.on('connection', (ws, req) => {
   
   if (!isTwilioAgent) {
     logEvent('WARNING_NON_TWILIO_CONNECTION', {
-      callSid: tempCallSid,
+      callSid: callSid,
       userAgent: userAgent,
       message: 'Conexão pode não ser do Twilio'
     });
   }
   
   logEvent('CONNECTION_ESTABLISHED', { 
-    callSid: tempCallSid,
+    callSid: callSid,
     isTwilioAgent: isTwilioAgent,
     activeConnections: wss.clients.size
   });
@@ -132,32 +147,13 @@ wss.on('connection', (ws, req) => {
         messageSize: message.length
       });
       
-      // Extrair callSid do evento 'start' se disponível
-      if (msg.event === 'start' && msg.start && msg.start.callSid) {
+      // Também extrair callSid do evento 'start' como backup
+      if (msg.event === 'start' && msg.start && msg.start.callSid && callSid.startsWith('TEMP_')) {
         callSid = msg.start.callSid;
-        logEvent('CALLSID_EXTRACTED', { 
+        logEvent('CALLSID_UPDATED', { 
           callSid, 
           source: 'start_event',
-          previousId: tempCallSid
-        });
-      }
-      
-      // Extrair callSid de qualquer outro campo que o Twilio possa enviar
-      if (msg.callSid && !callSid.startsWith('TEMP_')) {
-        callSid = msg.callSid;
-        logEvent('CALLSID_EXTRACTED', { 
-          callSid, 
-          source: 'message_root',
-          previousId: tempCallSid
-        });
-      }
-      
-      if (msg.call && msg.call.sid && !callSid.startsWith('TEMP_')) {
-        callSid = msg.call.sid;
-        logEvent('CALLSID_EXTRACTED', { 
-          callSid, 
-          source: 'call_object',
-          previousId: tempCallSid
+          previousId: `TEMP_${callSid.split('_')[1]}`
         });
       }
       
@@ -369,5 +365,5 @@ server.listen(PORT, () => {
   console.log(`📊 APIs: OpenAI=${!!OPENAI_API_KEY}, ElevenLabs=${!!ELEVENLABS_API_KEY}`);
   console.log(`🌐 Endpoints: /health, /status, /debug`);
   console.log(`🔌 WebSocket pronto para Twilio ConversationRelay`);
-  console.log(`🔧 Correções implementadas: Extração de callSid do payload, logs detalhados`);
+  console.log(`🔧 Correções implementadas: Extração de callSid da URL, logs detalhados`);
 });
