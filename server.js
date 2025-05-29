@@ -1,243 +1,358 @@
-// server.js - Servidor WebSocket para Twilio ConversationRelay
+// Servidor WebSocket dedicado para Twilio ConversationRelay
+// Template completo para implantação em Railway/Render
+
 require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const axios = require('axios');
-const fs = require('fs');
-const path = require('path');
 
 // Configuração do servidor
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// Diretório para logs
-const logsDir = path.join(__dirname, 'logs');
-if (!fs.existsSync(logsDir)) {
-  fs.mkdirSync(logsDir, { recursive: true });
-}
+const PORT = process.env.PORT || 8080;
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 // Função para log detalhado
 function logEvent(type, data) {
   const timestamp = new Date().toISOString();
-  const logMessage = `[${timestamp}] ${type}: ${JSON.stringify(data)}`;
-  console.log(logMessage);
-  
-  // Salvar logs em arquivo com data
-  const today = new Date().toISOString().split('T')[0];
-  const logFile = path.join(logsDir, `conversation_relay_${today}.log`);
-  fs.appendFileSync(logFile, logMessage + '\n');
+  console.log(`[${timestamp}] ${type}:`, JSON.stringify(data, null, 2));
 }
 
-// Inicialização do servidor
-const startTime = new Date();
-logEvent('SERVER_START', { timestamp: startTime.toISOString() });
+// Sistema de prompt para IA
+const systemPrompt = `Você é Laura, assistente virtual brasileira da Voxemy para atendimento telefônico.
+
+INSTRUÇÕES CRÍTICAS:
+- Seja natural, amigável e concisa (máximo 2 frases)
+- Use português brasileiro coloquial para telefone
+- Processe o que o cliente disse e responda adequadamente
+- Se não entender, peça para repetir educadamente
+- Mantenha a conversa fluindo naturalmente
+
+Esta é uma conversa telefônica ao vivo em tempo real.`;
+
+// Função para gerar resposta da IA
+async function generateAIResponse(userText, conversationHistory = []) {
+  if (!OPENAI_API_KEY) {
+    return "Desculpe, estou com problemas técnicos no momento.";
+  }
+
+  try {
+    const response = await axios.post('https://api.openai.com/v1/chat/completions', {
+      model: 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        ...conversationHistory.slice(-6),
+        { role: 'user', content: userText }
+      ],
+      max_tokens: 100,
+      temperature: 0.7
+    }, {
+      headers: {
+        'Authorization': `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    return response.data.choices[0]?.message?.content?.trim() || 
+           "Desculpe, não entendi bem. Pode repetir?";
+  } catch (error) {
+    logEvent('AI_ERROR', { error: error.message });
+    return "Desculpe, não entendi bem. Pode repetir?";
+  }
+}
 
 // Gerenciar conexões WebSocket
 wss.on('connection', (ws, req) => {
-  // Extrair callSid da URL de consulta (se disponível)
-  const url = new URL('http://localhost' + req.url);
-  const callSid = url.searchParams.get('callSid');
+  // Corrigir extração da URL e callSid
+  let callSid = null;
+  let fullUrl = null;
   
-  logEvent('CONNECTION', { 
-    url: req.url, 
-    callSid,
-    headers: req.headers,
-    timestamp: new Date().toISOString()
+  try {
+    // Construir URL correta usando headers do host
+    const host = req.headers.host || 'localhost:8080';
+    fullUrl = new URL(req.url, `http://${host}`);
+    callSid = fullUrl.searchParams.get('callSid');
+    
+    logEvent('CONNECTION_ATTEMPT', {
+      url: req.url,
+      host: req.headers.host,
+      fullUrl: fullUrl.toString(),
+      callSid: callSid,
+      userAgent: req.headers['user-agent'],
+      origin: req.headers.origin
+    });
+  } catch (urlError) {
+    logEvent('URL_PARSE_ERROR', {
+      error: urlError.message,
+      originalUrl: req.url,
+      headers: req.headers
+    });
+  }
+  
+  // Validação e warnings para callSid
+  if (!callSid) {
+    logEvent('WARNING_NO_CALLSID', {
+      message: 'Conexão WebSocket sem callSid detectada',
+      url: req.url,
+      headers: req.headers,
+      userAgent: req.headers['user-agent']
+    });
+    // Gerar callSid temporário para debug
+    callSid = `DEBUG_${Date.now()}`;
+  } else if (!callSid.startsWith('CA')) {
+    logEvent('WARNING_INVALID_CALLSID_FORMAT', {
+      callSid: callSid,
+      expected: 'Formato CAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+    });
+  }
+  
+  // Validação de origem Twilio
+  const userAgent = req.headers['user-agent'] || '';
+  const isTwilioAgent = userAgent.includes('TwilioProxy') || userAgent.includes('Twilio');
+  
+  if (!isTwilioAgent) {
+    logEvent('WARNING_NON_TWILIO_CONNECTION', {
+      callSid: callSid,
+      userAgent: userAgent,
+      message: 'Conexão pode não ser do Twilio'
+    });
+  }
+  
+  logEvent('CONNECTION_ESTABLISHED', { 
+    callSid: callSid,
+    isTwilioAgent: isTwilioAgent,
+    activeConnections: wss.clients.size
   });
   
-  // Manter conexão ativa com heartbeat
-  const interval = setInterval(() => {
+  let conversationHistory = [];
+  let hasGreeted = false;
+  
+  // Heartbeat para manter conexão ativa
+  const heartbeatInterval = setInterval(() => {
     if (ws.readyState === WebSocket.OPEN) {
       ws.ping();
-      logEvent('HEARTBEAT', { callSid, timestamp: new Date().toISOString() });
+      logEvent('HEARTBEAT_SENT', { callSid });
+    } else {
+      clearInterval(heartbeatInterval);
     }
   }, 25000);
   
   ws.on('message', async (message) => {
     try {
       const msg = JSON.parse(message);
-      logEvent('RECEIVED', msg);
+      logEvent('MESSAGE_RECEIVED', { 
+        callSid, 
+        event: msg.event, 
+        hasData: !!msg.data,
+        messageSize: message.length
+      });
       
-      // 1. Evento 'connected' - Handshake inicial
-      if (msg.event === 'connected') {
-        const response = { event: 'connected' };
-        logEvent('SENDING', response);
-        ws.send(JSON.stringify(response));
-      }
-      
-      // 2. Evento 'start' - Início da chamada
-      if (msg.event === 'start') {
-        const response = {
-          event: 'speak',
-          text: 'Olá! Aqui é a Voxemy. Como posso ajudar você hoje?',
-          config: {
-            provider: 'elevenlabs',
-            voice_id: process.env.ELEVENLABS_VOICE_ID || 'pNInz6obpgDQGcFmaJgB', // Voz em português brasileiro
-            stability: 0.35,
-            similarity: 0.75,
-            style: 0.4,
-            speed: 0.95,
-            audio_format: 'ulaw_8000' // Formato telefônico obrigatório
+      switch (msg.event) {
+        case 'connected':
+          logEvent('HANDSHAKE_RECEIVED', { callSid });
+          const response = { event: 'connected' };
+          ws.send(JSON.stringify(response));
+          logEvent('HANDSHAKE_SENT', { callSid, response });
+          break;
+          
+        case 'start':
+          logEvent('CALL_START', { callSid, streamSid: msg.start?.streamSid });
+          if (!hasGreeted) {
+            hasGreeted = true;
+            const greeting = {
+              event: 'speak',
+              text: 'Olá! Aqui é a Laura da Voxemy. Como posso ajudar você hoje?',
+              config: {
+                provider: ELEVENLABS_API_KEY ? 'elevenlabs' : 'twilio',
+                voice_id: 'FGY2WhTYpPnrIDTdsKH5',
+                stability: 0.35,
+                similarity: 0.75,
+                style: 0.4,
+                speed: 0.95,
+                audio_format: 'ulaw_8000'
+              }
+            };
+            
+            if (!ELEVENLABS_API_KEY) {
+              delete greeting.config.provider;
+              delete greeting.config.voice_id;
+              delete greeting.config.stability;
+              delete greeting.config.similarity;
+              delete greeting.config.style;
+              delete greeting.config.speed;
+            }
+            
+            ws.send(JSON.stringify(greeting));
+            logEvent('GREETING_SENT', { callSid, greeting });
           }
-        };
-        logEvent('SENDING', response);
-        ws.send(JSON.stringify(response));
-      }
-      
-      // 3. Evento 'media' - Áudio do usuário
-      if (msg.event === 'media') {
-        logEvent('MEDIA', { received: true, length: msg.media?.length || 0 });
-        // Processar áudio se necessário
-      }
-      
-      // 4. Evento 'transcript' - Transcrição do áudio
-      if (msg.event === 'transcript' && msg.transcript) {
-        logEvent('TRANSCRIPT', { speech: msg.transcript.speech });
-        
-        // Processar com IA e enviar resposta
-        const resposta = await processarComIA(msg.transcript.speech);
-        
-        const response = {
-          event: 'speak',
-          text: resposta,
-          config: {
-            provider: 'elevenlabs',
-            voice_id: process.env.ELEVENLABS_VOICE_ID || 'pNInz6obpgDQGcFmaJgB',
-            stability: 0.35,
-            similarity: 0.75,
-            style: 0.4,
-            speed: 0.95,
-            audio_format: 'ulaw_8000'
+          break;
+          
+        case 'media':
+          // Log apenas a cada 50 pacotes de media para não poluir
+          if (Math.random() < 0.02) { // ~2% dos pacotes
+            logEvent('MEDIA_SAMPLE', { 
+              callSid, 
+              mediaLength: msg.media?.length || 0,
+              timestamp: msg.media?.timestamp 
+            });
           }
-        };
-        
-        logEvent('SENDING', response);
-        ws.send(JSON.stringify(response));
+          break;
+          
+        case 'transcript':
+          if (msg.transcript?.speech) {
+            const userSpeech = msg.transcript.speech.trim();
+            logEvent('TRANSCRIPT_RECEIVED', { 
+              callSid, 
+              speech: userSpeech,
+              confidence: msg.transcript.confidence,
+              isFinal: msg.transcript.is_final 
+            });
+            
+            if (userSpeech.length > 2) {
+              conversationHistory.push({ role: 'user', content: userSpeech });
+              
+              const aiResponse = await generateAIResponse(userSpeech, conversationHistory);
+              
+              if (aiResponse) {
+                conversationHistory.push({ role: 'assistant', content: aiResponse });
+                
+                const speakEvent = {
+                  event: 'speak',
+                  text: aiResponse,
+                  config: {
+                    provider: ELEVENLABS_API_KEY ? 'elevenlabs' : 'twilio',
+                    voice_id: 'FGY2WhTYpPnrIDTdsKH5',
+                    stability: 0.35,
+                    similarity: 0.75,
+                    style: 0.4,
+                    speed: 0.95,
+                    audio_format: 'ulaw_8000'
+                  }
+                };
+                
+                if (!ELEVENLABS_API_KEY) {
+                  delete speakEvent.config.provider;
+                  delete speakEvent.config.voice_id;
+                  delete speakEvent.config.stability;
+                  delete speakEvent.config.similarity;
+                  delete speakEvent.config.style;
+                  delete speakEvent.config.speed;
+                }
+                
+                ws.send(JSON.stringify(speakEvent));
+                logEvent('AI_RESPONSE_SENT', { callSid, response: aiResponse });
+              }
+            }
+          }
+          break;
+          
+        case 'mark':
+          logEvent('MARK_RECEIVED', { callSid, mark: msg.mark });
+          break;
+          
+        case 'stop':
+          logEvent('CALL_END', { 
+            callSid, 
+            reason: msg.reason,
+            duration: conversationHistory.length 
+          });
+          clearInterval(heartbeatInterval);
+          ws.close();
+          break;
+          
+        default:
+          logEvent('UNKNOWN_EVENT', { callSid, event: msg.event, data: msg });
+          break;
       }
-      
-      // 5. Evento 'mark' - Marcadores de progresso
-      if (msg.event === 'mark') {
-        logEvent('MARK', { mark: msg.mark });
-        // Não requer resposta
-      }
-      
-      // 6. Evento 'stop' - Fim da chamada
-      if (msg.event === 'stop') {
-        logEvent('STOP', { reason: msg.reason });
-        clearInterval(interval);
-        ws.close();
-      }
-      
     } catch (error) {
-      logEvent('ERROR', { message: error.message, stack: error.stack });
+      logEvent('MESSAGE_PARSE_ERROR', { 
+        callSid, 
+        error: error.message, 
+        rawMessage: message.toString().substring(0, 200) + '...' 
+      });
     }
   });
   
-  ws.on('close', () => {
-    logEvent('CLOSE', { callSid });
-    clearInterval(interval);
+  ws.on('close', (code, reason) => {
+    logEvent('CONNECTION_CLOSED', { 
+      callSid, 
+      code, 
+      reason: reason?.toString(),
+      activeConnections: wss.clients.size - 1
+    });
+    clearInterval(heartbeatInterval);
   });
   
   ws.on('error', (error) => {
-    logEvent('ERROR', { message: error.message });
-    clearInterval(interval);
+    logEvent('WEBSOCKET_ERROR', { 
+      callSid, 
+      error: error.message,
+      stack: error.stack?.substring(0, 500)
+    });
+    clearInterval(heartbeatInterval);
+  });
+  
+  ws.on('pong', () => {
+    logEvent('HEARTBEAT_PONG', { callSid });
   });
 });
 
-// Função para processar com IA (substitua pela sua implementação)
-async function processarComIA(texto) {
-  logEvent('AI_PROCESSING', { input: texto });
-  
-  try {
-    // Se estiver configurada uma API de IA externa
-    if (process.env.AI_API_URL) {
-      const response = await axios.post(process.env.AI_API_URL, {
-        input: texto,
-        callerId: process.env.CALLER_ID || 'voxemy'
-      }, {
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${process.env.AI_API_KEY || ''}`
-        }
-      });
-      
-      return response.data.response || "Desculpe, não consegui processar sua solicitação.";
-    }
-    
-    // Implementação simples de fallback
-    if (texto.toLowerCase().includes('olá') || texto.toLowerCase().includes('oi')) {
-      return "Olá! Como posso ajudar você hoje?";
-    } else if (texto.toLowerCase().includes('ajuda')) {
-      return "Estou aqui para ajudar. O que você precisa?";
-    } else if (texto.toLowerCase().includes('tchau') || texto.toLowerCase().includes('adeus')) {
-      return "Foi um prazer conversar com você. Até a próxima!";
-    } else {
-      return "Entendi sua mensagem. Como posso ajudar com isso?";
-    }
-  } catch (error) {
-    logEvent('AI_ERROR', { message: error.message, stack: error.stack });
-    return "Desculpe, estou com dificuldades para processar sua solicitação no momento.";
-  }
-}
-
-// Rota de health check
+// Rotas HTTP para monitoramento
 app.get('/health', (req, res) => {
-  const uptime = Math.floor((new Date() - startTime) / 1000);
-  res.status(200).send({ 
+  res.status(200).json({ 
     status: 'ok', 
-    uptime: `${uptime} segundos`,
-    connections: wss.clients.size,
-    timestamp: new Date().toISOString() 
-  });
-});
-
-// Rota de status
-app.get('/status', (req, res) => {
-  const uptime = Math.floor((new Date() - startTime) / 1000);
-  const connections = wss.clients.size;
-  
-  res.status(200).send({
-    status: 'ok',
-    uptime: `${uptime} segundos`,
-    connections,
     timestamp: new Date().toISOString(),
-    environment: process.env.NODE_ENV || 'development',
-    version: process.env.npm_package_version || '1.0.0'
+    connections: wss.clients.size,
+    port: PORT,
+    apis: {
+      openai: !!OPENAI_API_KEY,
+      elevenlabs: !!ELEVENLABS_API_KEY
+    }
   });
 });
 
-// Rota principal
-app.get('/', (req, res) => {
-  res.send(`
-    <html>
-      <head>
-        <title>Voxemy WebSocket Server</title>
-        <style>
-          body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
-          h1 { color: #333; }
-          .status { padding: 10px; background-color: #f0f0f0; border-radius: 5px; }
-          .success { color: green; }
-        </style>
-      </head>
-      <body>
-        <h1>Voxemy WebSocket Server</h1>
-        <div class="status">
-          <p><strong>Status:</strong> <span class="success">Online</span></p>
-          <p><strong>Uptime:</strong> ${Math.floor((new Date() - startTime) / 1000)} segundos</p>
-          <p><strong>Conexões ativas:</strong> ${wss.clients.size}</p>
-          <p><strong>Versão:</strong> ${process.env.npm_package_version || '1.0.0'}</p>
-        </div>
-        <p>Este servidor está configurado para processar conexões WebSocket do Twilio ConversationRelay.</p>
-      </body>
-    </html>
-  `);
+app.get('/status', (req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    connections: wss.clients.size,
+    elevenlabs: !!ELEVENLABS_API_KEY,
+    openai: !!OPENAI_API_KEY,
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    memory: process.memoryUsage()
+  });
+});
+
+app.get('/debug', (req, res) => {
+  const connections = [];
+  wss.clients.forEach((client, index) => {
+    connections.push({
+      index,
+      readyState: client.readyState,
+      protocol: client.protocol
+    });
+  });
+  
+  res.status(200).json({
+    connections,
+    totalConnections: wss.clients.size,
+    timestamp: new Date().toISOString(),
+    environment: {
+      NODE_ENV: process.env.NODE_ENV,
+      PORT: PORT
+    }
+  });
 });
 
 // Iniciar o servidor
-const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
-  console.log(`Servidor WebSocket iniciado na porta ${PORT}`);
-  logEvent('SERVER_LISTENING', { port: PORT });
+  console.log(`🚀 Servidor WebSocket Voxemy CORRIGIDO iniciado na porta ${PORT}`);
+  console.log(`📊 APIs: OpenAI=${!!OPENAI_API_KEY}, ElevenLabs=${!!ELEVENLABS_API_KEY}`);
+  console.log(`🌐 Endpoints: /health, /status, /debug`);
+  console.log(`🔌 WebSocket pronto para Twilio ConversationRelay`);
+  console.log(`🔧 Correções implementadas: URL parsing, logs detalhados, validação Twilio`);
 });
